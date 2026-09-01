@@ -7,6 +7,7 @@ enum DrawModeState {
     Simulating,
 }
 
+#[allow(dead_code)]
 enum BoundaryMode{
     Wrap,
     Fixed,
@@ -105,6 +106,7 @@ impl Grid {
     }
 
     // Helper to visualize the grid in the terminal
+    #[allow(dead_code)]
     fn print(&self) {
         for y in 0..self.height {
             for x in 0..self.width {
@@ -225,23 +227,54 @@ fn main() {
             window.update_with_buffer(&buffer, width, height).unwrap();
         }
     } else {
-        // Fallback to the headless glider test
-        let mut grid = Grid::new(10, 10, BoundaryMode::Wrap);
-        
-        let glider_coords = [(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)];
-        for (x, y) in glider_coords {
-            let index = grid.get_index(x, y);
-            grid.current[index] = 1;
-        }
+        // Sequential CPU Benchmark Mode
+        let (size, generations) = if mode == "seq" {
+            let s = args.get(2).and_then(|v| v.parse::<usize>().ok()).unwrap_or(512);
+            let g = args.get(3).and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+            (s, g)
+        } else if let Ok(s) = mode.parse::<usize>() {
+            let g = args.get(2).and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+            (s, g)
+        } else {
+            (512, 100)
+        };
 
-        println!("Generation 0:");
-        grid.print();
+        let width = size;
+        let height = size;
+        let mut grid = Grid::new(width, height, BoundaryMode::Wrap);
+        grid.randomize();
 
-        for i in 1..=5 {
+        println!("Lattice — Phase 1: Sequential CPU Benchmark");
+        println!("──────────────────────────────────────────");
+        println!("Grid size:       {} × {} ({} cells)", width, height, width * height);
+        println!("Generations:     {}", generations);
+        println!("Seeding grid...  ready.");
+        println!("Running benchmark...");
+
+        let start = std::time::Instant::now();
+        for _ in 0..generations {
             grid.step();
-            println!("\nGeneration {}:", i);
-            grid.print();
         }
+        let elapsed = start.elapsed();
+
+        let total_cells_processed = (width * height * generations) as f64;
+        let elapsed_secs = elapsed.as_secs_f64();
+        let cells_per_sec = total_cells_processed / elapsed_secs;
+        let time_per_gen_ms = (elapsed.as_secs_f64() * 1000.0) / (generations as f64);
+
+        // Memory bandwidth estimation:
+        // Each cell reads itself + 8 neighbors (9 reads) + 1 write = ~10 bytes/cell
+        let bytes_per_cell = 10.0;
+        let total_bytes_accessed = total_cells_processed * bytes_per_cell;
+        let est_bandwidth_gb_s = (total_bytes_accessed / elapsed_secs) / 1_000_000_000.0;
+
+        println!("──────────────────────────────────────────");
+        println!("Total time:      {:.2?}", elapsed);
+        println!("Time / gen:      {:.3} ms", time_per_gen_ms);
+        println!("Throughput:      {:.2} M cells/sec", cells_per_sec / 1_000_000.0);
+        println!("Est. memory:     ~{:.2} GB accessed", total_bytes_accessed / 1_000_000_000.0);
+        println!("Est. bandwidth:  ~{:.2} GB/s", est_bandwidth_gb_s);
+        println!("──────────────────────────────────────────");
     }
 }
 
