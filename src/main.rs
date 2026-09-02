@@ -21,6 +21,51 @@ struct Grid {
     next: Vec<u8>,
 }
 
+fn get_index(width: usize, x: usize, y: usize) -> usize {
+    y * width + x
+}
+
+fn live_neighbor_count(current: &[u8], width: usize, height: usize, boundary_mode: &BoundaryMode, x: usize, y: usize) -> u8 {
+    let mut count = 0;
+    let offsets: [(isize, isize); 8] = [
+        (-1, -1), (0, -1), (1, -1),
+        (-1,  0),          (1,  0),
+        (-1,  1), (0,  1), (1,  1),
+    ];
+
+    for (dx, dy) in offsets {
+        match boundary_mode {
+            BoundaryMode::Wrap => {
+                let nx = (x as isize + dx).rem_euclid(width as isize) as usize;
+                let ny = (y as isize + dy).rem_euclid(height as isize) as usize;
+                let index = get_index(width, nx, ny);
+                count += current[index];
+            }
+            BoundaryMode::Fixed => {
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx >= 0 && nx < width as isize && ny >= 0 && ny < height as isize {
+                    let index = get_index(width, nx as usize, ny as usize);
+                    count += current[index];
+                }
+            }
+        }
+    }
+    count
+}
+
+fn update_cell(current: &[u8], width: usize, height: usize, boundary_mode: &BoundaryMode, x: usize, y: usize) -> u8 {
+    let index = get_index(width, x, y);
+    let alive = current[index] == 1;
+    let neighbors = live_neighbor_count(current, width, height, boundary_mode, x, y);
+
+    match (alive, neighbors) {
+        (true, 2) | (true, 3) => 1,
+        (false, 3) => 1,
+        _ => 0,
+    }
+}
+
 impl Grid {
     // 1. Initialize the grid
     fn new(width: usize, height: usize, boundary_mode: BoundaryMode) -> Self {
@@ -38,46 +83,7 @@ impl Grid {
 
     // 2. The 2D to 1D translation formula
     fn get_index(&self, x: usize, y: usize) -> usize {
-        y * self.width + x
-    }
-
-        fn live_neighbor_count(&self, x: usize, y: usize) -> u8 {
-        let mut count = 0;
-
-        // The 8 directions around a cell (dx, dy)
-        let offsets: [(isize, isize); 8] = [
-            (-1, -1), (0, -1), (1, -1), // Top row
-            (-1,  0),          (1,  0), // Middle row
-            (-1,  1), (0,  1), (1,  1), // Bottom row
-        ];
-
-        for (dx, dy) in offsets {
-            match self.boundary_mode {
-                BoundaryMode::Wrap => {
-                    // 1. Calculate the raw neighbor coordinates
-                    let nx = (x as isize + dx).rem_euclid(self.width as isize) as usize;
-                    let ny = (y as isize + dy).rem_euclid(self.height as isize) as usize;
-
-                    // 2. Convert to index and add to `count`
-                    let index = self.get_index(nx, ny);
-                    count += self.current[index];
-
-                }
-                BoundaryMode::Fixed => {
-                    // 1. Calculate the raw neighbor coordinates
-                    let nx = x as isize + dx;
-                    let ny = y as isize + dy;
-
-                    // 2. Check if the neighbor is within bounds
-                    if nx >= 0 && nx < self.width as isize && ny >= 0 && ny < self.height as isize {
-                        let index = self.get_index(nx as usize, ny as usize);
-                        count += self.current[index];
-                    }
-                }
-            }
-        }
-
-        count
+        get_index(self.width, x, y)
     }
 
     // 4. Update the grid to the next generation
@@ -85,23 +91,41 @@ impl Grid {
         for y in 0..self.height {
             for x in 0..self.width {
                 let index = self.get_index(x, y);
-                let alive = self.current[index] == 1;
-                let neighbors = self.live_neighbor_count(x, y);
-
-                let next_state = match (alive, neighbors) {
-                    // Rule 1: Any live cell with 2 or 3 live neighbours survives
-                    (true, 2) | (true, 3) => 1,
-                    // Rule 2: Any dead cell with exactly 3 live neighbours becomes live
-                    (false, 3) => 1,
-                    // Rule 3: All other cells die or stay dead
-                    _ => 0,
-                };
-
-                self.next[index] = next_state;
+                self.next[index] = update_cell(&self.current, self.width, self.height, &self.boundary_mode, x, y);
             }
         }
 
         // Swap the buffers in O(1) time! This prevents state contamination.
+        std::mem::swap(&mut self.current, &mut self.next);
+    }
+
+    // 5. Update the grid in parallel using row-band partitioning
+    fn step_parallel(&mut self, num_threads: usize) {
+        let rows_per_chunk = (self.height + num_threads - 1) / num_threads;
+        
+        let width = self.width;
+        let height = self.height;
+        let boundary_mode = &self.boundary_mode;
+        let current = &self.current;
+        
+        std::thread::scope(|s| {
+            // chunks_mut automatically gives disjoint mutable slices of the backing array.
+            for (chunk_idx, next_chunk) in self.next.chunks_mut(rows_per_chunk * width).enumerate() {
+                s.spawn(move || {
+                    let start_y = chunk_idx * rows_per_chunk;
+                    let chunk_height = next_chunk.len() / width;
+                    
+                    for dy in 0..chunk_height {
+                        let y = start_y + dy;
+                        for x in 0..width {
+                            let next_state = update_cell(current, width, height, boundary_mode, x, y);
+                            next_chunk[dy * width + x] = next_state;
+                        }
+                    }
+                });
+            }
+        });
+
         std::mem::swap(&mut self.current, &mut self.next);
     }
 
@@ -226,6 +250,70 @@ fn main() {
 
             window.update_with_buffer(&buffer, width, height).unwrap();
         }
+    } else if mode == "par" {
+        let arg2 = args.get(2).map(|s| s.as_str()).unwrap_or("sweep");
+        let width = args.get(3).and_then(|v| v.parse::<usize>().ok()).unwrap_or(512);
+        let generations = args.get(4).and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+
+        println!("Lattice — Phase 2: Multi-threaded CPU Benchmark");
+        println!("──────────────────────────────────────────");
+        println!("Grid size:       {} × {} ({} cells)", width, width, width * width);
+        println!("Generations:     {}", generations);
+        println!();
+
+        if arg2 == "sweep" {
+            println!("{:<8} | {:<12} | {:<16} | {:<9} | {:<10}", "Threads", "Total Time", "Throughput", "Speedup", "Est. BW");
+            println!("─────────|──────────────|──────────────────|───────────|──────────");
+            
+            let thread_counts = vec![1, 2, 4, 8, 10, 16];
+            let mut baseline_time = 0.0;
+            
+            for t in thread_counts {
+                let mut grid = Grid::new(width, width, BoundaryMode::Wrap);
+                grid.randomize();
+                
+                let start = std::time::Instant::now();
+                for _ in 0..generations {
+                    grid.step_parallel(t);
+                }
+                let elapsed = start.elapsed();
+                let elapsed_secs = elapsed.as_secs_f64();
+                
+                if t == 1 {
+                    baseline_time = elapsed_secs;
+                }
+                
+                let total_cells = (width * width * generations) as f64;
+                let cells_per_sec = total_cells / elapsed_secs;
+                let speedup = baseline_time / elapsed_secs;
+                let est_bandwidth = (total_cells * 10.0 / elapsed_secs) / 1_000_000_000.0;
+                
+                println!("{:<8} | {:<10.2?} | {:>6.2} M c/s    | {:>5.2}x   | {:>5.2} GB/s", 
+                    t, elapsed, cells_per_sec / 1_000_000.0, speedup, est_bandwidth);
+            }
+            println!("──────────────────────────────────────────");
+        } else {
+            let num_threads = arg2.parse::<usize>().unwrap_or(4);
+            let mut grid = Grid::new(width, width, BoundaryMode::Wrap);
+            grid.randomize();
+            
+            let start = std::time::Instant::now();
+            for _ in 0..generations {
+                grid.step_parallel(num_threads);
+            }
+            let elapsed = start.elapsed();
+            
+            let total_cells = (width * width * generations) as f64;
+            let elapsed_secs = elapsed.as_secs_f64();
+            let cells_per_sec = total_cells / elapsed_secs;
+            let est_bandwidth_gb_s = (total_cells * 10.0 / elapsed_secs) / 1_000_000_000.0;
+
+            println!("Threads:         {}", num_threads);
+            println!("Total time:      {:.2?}", elapsed);
+            println!("Throughput:      {:.2} M cells/sec", cells_per_sec / 1_000_000.0);
+            println!("Est. bandwidth:  ~{:.2} GB/s", est_bandwidth_gb_s);
+            println!("──────────────────────────────────────────");
+        }
     } else {
         // Sequential CPU Benchmark Mode
         let (size, generations) = if mode == "seq" {
@@ -263,7 +351,6 @@ fn main() {
         let time_per_gen_ms = (elapsed.as_secs_f64() * 1000.0) / (generations as f64);
 
         // Memory bandwidth estimation:
-        // Each cell reads itself + 8 neighbors (9 reads) + 1 write = ~10 bytes/cell
         let bytes_per_cell = 10.0;
         let total_bytes_accessed = total_cells_processed * bytes_per_cell;
         let est_bandwidth_gb_s = (total_bytes_accessed / elapsed_secs) / 1_000_000_000.0;
@@ -297,5 +384,24 @@ mod tests {
         
         // Bottom-right corner (Row 4, Column 4) -> (4 * 5) + 4 = 24
         assert_eq!(grid.get_index(4, 4), 24);
+    }
+
+    #[test]
+    fn test_parallel_correctness() {
+        // Create two identical randomized grids
+        let mut grid_seq = Grid::new(100, 100, BoundaryMode::Wrap);
+        grid_seq.randomize();
+        
+        let mut grid_par = Grid::new(100, 100, BoundaryMode::Wrap);
+        grid_par.current.copy_from_slice(&grid_seq.current);
+
+        // Run both for 10 generations
+        for _ in 0..10 {
+            grid_seq.step();
+            grid_par.step_parallel(4);
+        }
+
+        // Assert they are byte-for-byte identical
+        assert_eq!(grid_seq.current, grid_par.current);
     }
 }
