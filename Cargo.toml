@@ -7,3 +7,5 @@ edition = "2024"
 clap = { version = "4.6.6", features = ["derive"] }
 minifb = "0.28.0"
 rand = "0.10.2"
+metal = "0.33"
+objc = "0.2"

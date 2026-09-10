@@ -1,5 +1,9 @@
 use rand::RngExt;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use metal::*;
+use objc::rc::autoreleasepool;
+#[allow(unused_imports)]
+use objc::{msg_send, sel, sel_impl};
 
 #[derive(PartialEq)]
 enum DrawModeState {
@@ -152,6 +156,96 @@ impl Grid {
                 self.current[i] = 0;
             }
         }
+    }
+}
+
+struct GpuLifeEngine {
+    // `device` must be kept alive for the entire lifetime of all Metal objects it created.
+    // The compiler sees it as unread, but dropping it would invalidate buffers & pipeline.
+    #[allow(dead_code)]
+    device: Device,
+    command_queue: CommandQueue,
+    pipeline_state: ComputePipelineState,
+    buf_current: Buffer,
+    buf_next: Buffer,
+    buf_grid_size: Buffer,
+    width: usize,
+    height: usize,
+}
+
+impl GpuLifeEngine {
+    fn new(width: usize, height: usize, initial_data: &[u8]) -> Self {
+        let device = Device::system_default().expect("No Metal device found");
+        let command_queue = device.new_command_queue();
+
+        let source = include_str!("life.metal");
+        let options = CompileOptions::new();
+        let library = device.new_library_with_source(source, &options).expect("Failed to compile MSL");
+        let function = library.get_function("game_of_life", None).expect("Kernel function not found");
+        let pipeline_state = device.new_compute_pipeline_state_with_function(&function).expect("Failed to create pipeline");
+
+        let grid_bytes = (width * height) as u64;
+        let buf_current = device.new_buffer_with_data(
+            initial_data.as_ptr() as *const _,
+            grid_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let buf_next = device.new_buffer(
+            grid_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        
+        let grid_size: [u32; 2] = [width as u32, height as u32];
+        let buf_grid_size = device.new_buffer_with_data(
+            grid_size.as_ptr() as *const _,
+            8,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        Self {
+            device,
+            command_queue,
+            pipeline_state,
+            buf_current,
+            buf_next,
+            buf_grid_size,
+            width,
+            height,
+        }
+    }
+
+    fn step(&mut self, threadgroup_size: u64) -> (f64, f64) {
+        let mut kernel_time = 0.0;
+        let start = std::time::Instant::now();
+        
+        autoreleasepool(|| {
+            let command_buffer = self.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+
+            encoder.set_compute_pipeline_state(&self.pipeline_state);
+            encoder.set_buffer(0, Some(&self.buf_current), 0);
+            encoder.set_buffer(1, Some(&self.buf_next), 0);
+            encoder.set_buffer(2, Some(&self.buf_grid_size), 0);
+
+            let grid_size = MTLSize::new(self.width as u64, self.height as u64, 1);
+            let tg_size = MTLSize::new(threadgroup_size, threadgroup_size, 1);
+
+            encoder.dispatch_threads(grid_size, tg_size);
+            encoder.end_encoding();
+
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            
+            let start_time: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
+            let end_time: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
+            kernel_time = end_time - start_time;
+        });
+
+        let total_time = start.elapsed().as_secs_f64();
+        
+        std::mem::swap(&mut self.buf_current, &mut self.buf_next);
+        
+        (total_time, kernel_time)
     }
 }
 
@@ -314,6 +408,85 @@ fn main() {
             println!("Est. bandwidth:  ~{:.2} GB/s", est_bandwidth_gb_s);
             println!("──────────────────────────────────────────");
         }
+    } else if mode == "gpu" {
+        let arg2 = args.get(2).map(|s| s.as_str()).unwrap_or("sweep");
+        let width = args.get(3).and_then(|v| v.parse::<usize>().ok()).unwrap_or(512);
+        let generations = args.get(4).and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+
+        println!("Lattice — Phase 3: GPU (Metal) Benchmark");
+        println!("──────────────────────────────────────────");
+        println!("Grid size:       {} × {} ({} cells)", width, width, width * width);
+        println!("Generations:     {}", generations);
+        println!("GPU Device:      Apple Silicon (Unified Memory)");
+        println!();
+
+        if arg2 == "sweep" {
+            println!("{:<11} | {:<12} | {:<12} | {:<16} | {:<10}", "Threadgroup", "Wall Time", "GPU Time", "Throughput", "Est. BW");
+            println!("────────────|──────────────|──────────────|──────────────────|──────────");
+            
+            let tg_sizes = vec![16, 32];
+            
+            for tg in tg_sizes {
+                let mut grid = Grid::new(width, width, BoundaryMode::Wrap);
+                grid.randomize();
+                let mut gpu_engine = GpuLifeEngine::new(width, width, &grid.current);
+                
+                let mut total_wall_time = 0.0;
+                let mut total_gpu_time = 0.0;
+                
+                // Warmup
+                gpu_engine.step(tg);
+                
+                for _ in 0..generations {
+                    let (wall, gpu) = gpu_engine.step(tg);
+                    total_wall_time += wall;
+                    total_gpu_time += gpu;
+                }
+                
+                let total_cells = (width * width * generations) as f64;
+                // We use GPU time for the theoretical throughput limit
+                let cells_per_sec = total_cells / total_gpu_time; 
+                let est_bandwidth = (total_cells * 10.0 / total_gpu_time) / 1_000_000_000.0;
+                
+                println!("{:<11} | {:>9.2} ms | {:>9.2} ms | {:>6.2} M c/s    | {:>5.2} GB/s", 
+                    format!("{}x{}", tg, tg), 
+                    total_wall_time * 1000.0, 
+                    total_gpu_time * 1000.0, 
+                    cells_per_sec / 1_000_000.0, 
+                    est_bandwidth);
+            }
+            println!("──────────────────────────────────────────");
+        } else {
+            let tg_size = arg2.parse::<u64>().unwrap_or(16);
+            let mut grid = Grid::new(width, width, BoundaryMode::Wrap);
+            grid.randomize();
+            let mut gpu_engine = GpuLifeEngine::new(width, width, &grid.current);
+            
+            let mut total_wall_time = 0.0;
+            let mut total_gpu_time = 0.0;
+            
+            // Warmup
+            gpu_engine.step(tg_size);
+            
+            for _ in 0..generations {
+                let (wall, gpu) = gpu_engine.step(tg_size);
+                total_wall_time += wall;
+                total_gpu_time += gpu;
+            }
+            
+            let total_cells = (width * width * generations) as f64;
+            let cells_per_sec = total_cells / total_gpu_time;
+            let dispatch_overhead = total_wall_time - total_gpu_time;
+            let est_bandwidth_gb_s = (total_cells * 10.0 / total_gpu_time) / 1_000_000_000.0;
+
+            println!("Threadgroup:     {}x{}", tg_size, tg_size);
+            println!("Total wall-clock:{:.2} ms", total_wall_time * 1000.0);
+            println!("GPU kernel time: {:.2} ms", total_gpu_time * 1000.0);
+            println!("Dispatch overhead:{:.2} ms", dispatch_overhead * 1000.0);
+            println!("Throughput:      {:.2} M cells/sec", cells_per_sec / 1_000_000.0);
+            println!("Est. bandwidth:  ~{:.2} GB/s", est_bandwidth_gb_s);
+            println!("──────────────────────────────────────────");
+        }
     } else {
         // Sequential CPU Benchmark Mode
         let (size, generations) = if mode == "seq" {
@@ -403,5 +576,32 @@ mod tests {
 
         // Assert they are byte-for-byte identical
         assert_eq!(grid_seq.current, grid_par.current);
+    }
+
+    #[test]
+    fn test_gpu_correctness() {
+        let width = 100;
+        let height = 100;
+        let mut grid_seq = Grid::new(width, height, BoundaryMode::Wrap);
+        grid_seq.randomize();
+        
+        let mut gpu_engine = GpuLifeEngine::new(width, height, &grid_seq.current);
+
+        // Run both for 10 generations
+        for _ in 0..10 {
+            grid_seq.step();
+            gpu_engine.step(16);
+        }
+
+        // Read back from GPU
+        let gpu_result = unsafe {
+            std::slice::from_raw_parts(
+                gpu_engine.buf_current.contents() as *const u8,
+                width * height,
+            )
+        };
+
+        // Assert they are byte-for-byte identical
+        assert_eq!(grid_seq.current, gpu_result);
     }
 }

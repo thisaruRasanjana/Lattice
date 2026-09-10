@@ -12,7 +12,7 @@ The goal is to understand how parallel architectures behave at the hardware leve
 
 - [x] **Phase 1 — Sequential CPU:** Flat memory layout, double buffering, and B3/S23 state updates with baseline throughput & bandwidth profiling.
 - [x] **Phase 2 — Multi-threaded CPU:** Row-band partitioning via `std::thread::scope`, synchronization-free disjoint writes, multi-core scaling analysis.
-- [ ] **Phase 3 — GPU (Metal):** Per-cell update as a Metal compute shader dispatched from Rust. Unified memory via `storageModeShared` with isolated dispatch vs kernel timing.
+- [x] **Phase 3 — GPU (Metal):** Per-cell update as a Metal compute shader dispatched from Rust. Unified memory via `storageModeShared` with isolated dispatch vs kernel timing.
 - [ ] **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
 - [ ] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
 - [ ] **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
@@ -46,6 +46,12 @@ cargo run --release -- par sweep
 
 # Multi-threaded CPU benchmark with N threads (default: 4)
 cargo run --release -- par 8
+
+# GPU benchmark sweep (tests 16x16 and 32x32 threadgroups)
+cargo run --release -- gpu sweep
+
+# GPU benchmark with specific threadgroup size
+cargo run --release -- gpu 16
 
 # Live random-seed visualization
 cargo run -- visual
