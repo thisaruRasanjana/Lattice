@@ -487,6 +487,103 @@ fn main() {
             println!("Est. bandwidth:  ~{:.2} GB/s", est_bandwidth_gb_s);
             println!("──────────────────────────────────────────");
         }
+    } else if mode == "bench" {
+        let generations = args.get(2).and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+
+        println!("Lattice — Phase 4: Cross-Architecture Benchmark");
+        println!("────────────────────────────────────────────────────────────────────────────────────────");
+        println!("Hardware:    Apple Silicon (M-Series, Unified Memory)");
+        println!("Generations: {}", generations);
+        println!();
+
+        println!("{:<11} | {:<14} | {:<14} | {:<14} | {:<14} | {:<12}", 
+            "Grid Size", "Seq CPU", "Par CPU (8T)", "GPU (kernel)", "GPU (wall)", "GPU Speedup");
+        println!("────────────|────────────────|────────────────|────────────────|────────────────|─────────────");
+
+        let sizes = vec![64, 128, 256, 512, 1024, 2048, 4096];
+
+        struct BenchResult {
+            size: usize,
+            seq_time: f64,
+            par_time: f64,
+            gpu_kernel: f64,
+            gpu_wall: f64,
+        }
+        let mut results = Vec::new();
+
+        for size in &sizes {
+            let width = *size;
+            let mut grid_master = Grid::new(width, width, BoundaryMode::Wrap);
+            grid_master.randomize();
+
+            // 1. Seq CPU
+            let mut grid_seq = Grid::new(width, width, BoundaryMode::Wrap);
+            grid_seq.current.copy_from_slice(&grid_master.current);
+            let start = std::time::Instant::now();
+            for _ in 0..generations {
+                grid_seq.step();
+            }
+            let seq_time = start.elapsed().as_secs_f64();
+
+            // 2. Par CPU (8 threads)
+            let mut grid_par = Grid::new(width, width, BoundaryMode::Wrap);
+            grid_par.current.copy_from_slice(&grid_master.current);
+            let start = std::time::Instant::now();
+            for _ in 0..generations {
+                grid_par.step_parallel(8);
+            }
+            let par_time = start.elapsed().as_secs_f64();
+
+            // 3. GPU (16x16)
+            let mut gpu_engine = GpuLifeEngine::new(width, width, &grid_master.current);
+            let mut gpu_wall = 0.0;
+            let mut gpu_kernel = 0.0;
+            gpu_engine.step(16); // warmup
+            for _ in 0..generations {
+                let (wall, kernel) = gpu_engine.step(16);
+                gpu_wall += wall;
+                gpu_kernel += kernel;
+            }
+
+            let best_cpu = seq_time.min(par_time);
+            let speedup = best_cpu / gpu_kernel;
+
+            println!("{:<11} | {:>11.2} ms | {:>11.2} ms | {:>11.2} ms | {:>11.2} ms | {:>9.2}x", 
+                format!("{}x{}", width, width), 
+                seq_time * 1000.0, 
+                par_time * 1000.0, 
+                gpu_kernel * 1000.0, 
+                gpu_wall * 1000.0,
+                speedup);
+
+            results.push(BenchResult {
+                size: width,
+                seq_time,
+                par_time,
+                gpu_kernel,
+                gpu_wall,
+            });
+        }
+        println!("────────────────────────────────────────────────────────────────────────────────────────");
+        println!();
+        println!("Throughput (M cells/sec):");
+        println!("{:<11} | {:<14} | {:<14} | {:<14} | {:<14} | {:<14}", 
+            "Grid Size", "Seq CPU", "Par CPU (8T)", "GPU (kernel)", "Est. BW (GPU)", "Dispatch OH%");
+        println!("────────────|────────────────|────────────────|────────────────|────────────────|────────────────");
+        
+        for r in results {
+            let total_cells = (r.size * r.size * generations) as f64;
+            let seq_thr = (total_cells / r.seq_time) / 1_000_000.0;
+            let par_thr = (total_cells / r.par_time) / 1_000_000.0;
+            let gpu_thr = (total_cells / r.gpu_kernel) / 1_000_000.0;
+            let est_bw = (total_cells * 10.0 / r.gpu_kernel) / 1_000_000_000.0;
+            let dispatch_overhead_pct = ((r.gpu_wall - r.gpu_kernel) / r.gpu_wall) * 100.0;
+
+            println!("{:<11} | {:>14.2} | {:>14.2} | {:>14.2} | {:>9.2} GB/s | {:>10.1}%", 
+                format!("{}x{}", r.size, r.size), seq_thr, par_thr, gpu_thr, est_bw, dispatch_overhead_pct);
+        }
+        println!("────────────────────────────────────────────────────────────────────────────────────────────────────────");
+
     } else {
         // Sequential CPU Benchmark Mode
         let (size, generations) = if mode == "seq" {

@@ -13,7 +13,7 @@ The goal is to understand how parallel architectures behave at the hardware leve
 - [x] **Phase 1 — Sequential CPU:** Flat memory layout, double buffering, and B3/S23 state updates with baseline throughput & bandwidth profiling.
 - [x] **Phase 2 — Multi-threaded CPU:** Row-band partitioning via `std::thread::scope`, synchronization-free disjoint writes, multi-core scaling analysis.
 - [x] **Phase 3 — GPU (Metal):** Per-cell update as a Metal compute shader dispatched from Rust. Unified memory via `storageModeShared` with isolated dispatch vs kernel timing.
-- [ ] **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
+- [x] **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
 - [ ] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
 - [ ] **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
 - [ ] **Phase 7 — Local LLM Profiling:** MLX / llama.cpp on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
@@ -53,6 +53,9 @@ cargo run --release -- gpu sweep
 # GPU benchmark with specific threadgroup size
 cargo run --release -- gpu 16
 
+# Full cross-architecture benchmark sweep (Phases 1, 2, and 3 comparison)
+cargo run --release -- bench
+
 # Live random-seed visualization
 cargo run -- visual
 
@@ -71,4 +74,3 @@ cargo test
 - [`minifb`](https://github.com/emoon/rust_minifb) — raw framebuffer window for visualization
 - [`rand`](https://github.com/rust-random/rand) — grid seeding
 - [`metal`](https://github.com/gfx-rs/metal-rs) — Rust bindings to Apple's Metal API *(Phase 3+)*
-- [`criterion`](https://github.com/bheisler/criterion.rs) — benchmarking harness *(Phase 4)*
