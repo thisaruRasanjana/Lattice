@@ -249,6 +249,120 @@ impl GpuLifeEngine {
     }
 }
 
+fn matmul_cpu(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for i in 0..k {
+                sum += a[row * k + i] * b[i * n + col];
+            }
+            c[row * n + col] = sum;
+        }
+    }
+}
+
+struct GpuMatmulEngine {
+    #[allow(dead_code)]
+    device: Device,
+    command_queue: CommandQueue,
+    pipeline_state: ComputePipelineState,
+    buf_a: Buffer,
+    buf_b: Buffer,
+    buf_c: Buffer,
+    buf_dims: Buffer,
+    #[allow(dead_code)]
+    m: usize,
+    #[allow(dead_code)]
+    k: usize,
+    #[allow(dead_code)]
+    n: usize,
+}
+
+impl GpuMatmulEngine {
+    fn new(m: usize, k: usize, n: usize, a_data: &[f32], b_data: &[f32]) -> Self {
+        let device = Device::system_default().expect("No Metal device found");
+        let command_queue = device.new_command_queue();
+
+        let source = include_str!("matmul.metal");
+        let options = CompileOptions::new();
+        let library = device.new_library_with_source(source, &options).expect("Failed to compile MSL");
+        let function = library.get_function("matmul", None).expect("Kernel function not found");
+        let pipeline_state = device.new_compute_pipeline_state_with_function(&function).expect("Failed to create pipeline");
+
+        let bytes_a = (m * k * 4) as u64;
+        let bytes_b = (k * n * 4) as u64;
+        let bytes_c = (m * n * 4) as u64;
+
+        let buf_a = device.new_buffer_with_data(
+            a_data.as_ptr() as *const _,
+            bytes_a,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let buf_b = device.new_buffer_with_data(
+            b_data.as_ptr() as *const _,
+            bytes_b,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let buf_c = device.new_buffer(
+            bytes_c,
+            MTLResourceOptions::StorageModeShared,
+        );
+        
+        // uint3 is aligned to 16 bytes in Metal, so we use [u32; 4] in Rust
+        let dims_padded: [u32; 4] = [m as u32, k as u32, n as u32, 0];
+        let buf_dims = device.new_buffer_with_data(
+            dims_padded.as_ptr() as *const _,
+            16,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        Self {
+            device,
+            command_queue,
+            pipeline_state,
+            buf_a,
+            buf_b,
+            buf_c,
+            buf_dims,
+            m,
+            k,
+            n,
+        }
+    }
+
+    fn step(&mut self, tg_size: u64) -> (f64, f64) {
+        let mut kernel_time = 0.0;
+        let start = std::time::Instant::now();
+        
+        autoreleasepool(|| {
+            let command_buffer = self.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+
+            encoder.set_compute_pipeline_state(&self.pipeline_state);
+            encoder.set_buffer(0, Some(&self.buf_a), 0);
+            encoder.set_buffer(1, Some(&self.buf_b), 0);
+            encoder.set_buffer(2, Some(&self.buf_c), 0);
+            encoder.set_buffer(3, Some(&self.buf_dims), 0);
+
+            let grid_size = MTLSize::new(self.n as u64, self.m as u64, 1);
+            let tg_size_metal = MTLSize::new(tg_size, tg_size, 1);
+
+            encoder.dispatch_threads(grid_size, tg_size_metal);
+            encoder.end_encoding();
+
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            
+            let start_time: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
+            let end_time: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
+            kernel_time = end_time - start_time;
+        });
+
+        let total_time = start.elapsed().as_secs_f64();
+        (total_time, kernel_time)
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = if args.len() > 1 { args[1].as_str() } else { "seq" };
@@ -583,6 +697,83 @@ fn main() {
                 format!("{}x{}", r.size, r.size), seq_thr, par_thr, gpu_thr, est_bw, dispatch_overhead_pct);
         }
         println!("────────────────────────────────────────────────────────────────────────────────────────────────────────");
+    } else if mode == "matmul" {
+        let arg2 = args.get(2).map(|s| s.as_str()).unwrap_or("sweep");
+        
+        println!("Lattice — Phase 5: GPU Matrix Multiplication");
+        println!("────────────────────────────────────────────────────────────────────────");
+        println!("Hardware:    Apple Silicon (M-Series, Unified Memory)");
+        println!("Type:        Square M×M matrices, f32 precision");
+        println!();
+        
+        if arg2 == "sweep" {
+            println!("{:<11} | {:<12} | {:<12} | {:<12} | {:<10}", 
+                "Matrix Size", "CPU Time", "GPU Time", "GPU GFLOPS", "Speedup");
+            println!("────────────|──────────────|──────────────|──────────────|──────────");
+            
+            let sizes = vec![64, 128, 256, 512, 1024, 2048];
+            
+            for size in sizes {
+                let m = size;
+                let k = size;
+                let n = size;
+                
+                // Initialize matrices with simple sequence data for benchmark consistency
+                let a_data: Vec<f32> = (0..m*k).map(|x| (x % 100) as f32 * 0.01).collect();
+                let b_data: Vec<f32> = (0..k*n).map(|x| (x % 100) as f32 * 0.01).collect();
+                let mut c_cpu = vec![0.0f32; m*n];
+                
+                // 1. CPU
+                // Skip CPU benchmark for sizes > 512 as it takes way too long
+                let mut cpu_time = f64::MAX;
+                if size <= 512 {
+                    let start = std::time::Instant::now();
+                    matmul_cpu(&a_data, &b_data, &mut c_cpu, m, k, n);
+                    cpu_time = start.elapsed().as_secs_f64();
+                }
+                
+                // 2. GPU
+                let mut gpu_engine = GpuMatmulEngine::new(m, k, n, &a_data, &b_data);
+                gpu_engine.step(16); // warmup
+                
+                // We run 10 iterations on GPU to get a stable average
+                let mut total_kernel = 0.0;
+                let iters = 10;
+                for _ in 0..iters {
+                    let (_, kernel) = gpu_engine.step(16);
+                    total_kernel += kernel;
+                }
+                let gpu_time = total_kernel / (iters as f64);
+                
+                // Metrics
+                let ops = (2 * m * k * n) as f64;
+                let gflops = ops / gpu_time / 1_000_000_000.0;
+                
+                let cpu_str = if size <= 512 { format!("{:>8.2} ms", cpu_time * 1000.0) } else { "   Skip   ".to_string() };
+                let speedup_str = if size <= 512 { format!("{:>7.1}x", cpu_time / gpu_time) } else { "   N/A   ".to_string() };
+                
+                println!("{:<11} | {:<12} | {:>9.2} ms | {:>12.2} | {:<10}", 
+                    format!("{}x{}", size, size), cpu_str, gpu_time * 1000.0, gflops, speedup_str);
+            }
+            println!("────────────────────────────────────────────────────────────────────────");
+        } else {
+            let size = arg2.parse::<usize>().unwrap_or(512);
+            let m = size; let k = size; let n = size;
+            
+            let a_data: Vec<f32> = (0..m*k).map(|x| (x % 100) as f32 * 0.01).collect();
+            let b_data: Vec<f32> = (0..k*n).map(|x| (x % 100) as f32 * 0.01).collect();
+            
+            let mut gpu_engine = GpuMatmulEngine::new(m, k, n, &a_data, &b_data);
+            
+            let (wall, kernel) = gpu_engine.step(16);
+            let ops = (2 * m * k * n) as f64;
+            let gflops = ops / kernel / 1_000_000_000.0;
+            
+            println!("Matrix size:  {}x{} ({} ops)", m, m, ops);
+            println!("GPU kernel:   {:.2} ms", kernel * 1000.0);
+            println!("Wall time:    {:.2} ms", wall * 1000.0);
+            println!("Performance:  {:.2} GFLOPS", gflops);
+        }
 
     } else {
         // Sequential CPU Benchmark Mode
@@ -700,5 +891,42 @@ mod tests {
 
         // Assert they are byte-for-byte identical
         assert_eq!(grid_seq.current, gpu_result);
+    }
+
+    #[test]
+    fn test_matmul_correctness() {
+        let m = 64;
+        let k = 64;
+        let n = 64;
+        
+        // Randomize matrices A and B
+        let mut rng = rand::rng();
+        let mut a_data = vec![0.0f32; m * k];
+        let mut b_data = vec![0.0f32; k * n];
+        
+        for i in 0..a_data.len() { a_data[i] = rng.random_range(0.0..1.0); }
+        for i in 0..b_data.len() { b_data[i] = rng.random_range(0.0..1.0); }
+        
+        // CPU output
+        let mut c_cpu = vec![0.0f32; m * n];
+        matmul_cpu(&a_data, &b_data, &mut c_cpu, m, k, n);
+        
+        // GPU output
+        let mut gpu_engine = GpuMatmulEngine::new(m, k, n, &a_data, &b_data);
+        gpu_engine.step(16);
+        
+        let gpu_result = unsafe {
+            std::slice::from_raw_parts(
+                gpu_engine.buf_c.contents() as *const f32,
+                m * n,
+            )
+        };
+        
+        // Check for equivalence with epsilon
+        let epsilon = 1e-3;
+        for i in 0..(m * n) {
+            assert!((c_cpu[i] - gpu_result[i]).abs() < epsilon, 
+                "Mismatch at {}: CPU {} vs GPU {}", i, c_cpu[i], gpu_result[i]);
+        }
     }
 }

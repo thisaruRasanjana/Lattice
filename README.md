@@ -14,7 +14,7 @@ The goal is to understand how parallel architectures behave at the hardware leve
 - [x] **Phase 2 — Multi-threaded CPU:** Row-band partitioning via `std::thread::scope`, synchronization-free disjoint writes, multi-core scaling analysis.
 - [x] **Phase 3 — GPU (Metal):** Per-cell update as a Metal compute shader dispatched from Rust. Unified memory via `storageModeShared` with isolated dispatch vs kernel timing.
 - [x] **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
-- [ ] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
+- [x] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
 - [ ] **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
 - [ ] **Phase 7 — Local LLM Profiling:** MLX / llama.cpp on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
 - [ ] **Phase 8 — Writeup:** Portfolio narrative connecting phase 4 throughput results to phase 7 inference profiling.
@@ -29,6 +29,9 @@ Double buffering is used throughout: generation N is read from one buffer, gener
 
 ### Memory Bandwidth Estimation
 Every phase measures throughput (cells/second) and reasons about memory traffic. In Game of Life, updating a cell reads 9 cells (itself + 8 neighbors) and writes 1 cell result (~10 bytes/cell). By calculating `(10 bytes × total_cells) / elapsed_time`, we compute an upper-bound memory bandwidth estimate and compare it against the M2's theoretical peak memory bandwidth (~100 GB/s) to evaluate whether a kernel is compute-bound or memory-bandwidth-bound.
+
+### Compute-Bound vs Memory-Bound (Phase 5+)
+While Game of Life is a *memory-bound* operation (the GPU cores finish the stencil calculation faster than RAM can supply the grid data), Matrix Multiplication (Phase 5) introduces a *compute-bound* workload. Multiplying an N×N matrix involves O(N²) memory reads but performs O(N³) arithmetic operations. Because the ratio of math-to-memory scales with N, large matrices allow the GPU's Arithmetic Logic Units (ALUs) to reach their maximum potential. For compute-bound kernels, performance is measured in **GFLOPS** (Giga Floating-point Operations Per Second) rather than cells/second or memory bandwidth.
 
 ---
 
@@ -55,6 +58,12 @@ cargo run --release -- gpu 16
 
 # Full cross-architecture benchmark sweep (Phases 1, 2, and 3 comparison)
 cargo run --release -- bench
+
+# GPU Matmul benchmark sweep (Phase 5)
+cargo run --release -- matmul sweep
+
+# GPU Matmul benchmark with specific matrix size
+cargo run --release -- matmul 1024
 
 # Live random-seed visualization
 cargo run -- visual
