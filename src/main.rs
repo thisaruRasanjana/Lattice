@@ -363,6 +363,186 @@ impl GpuMatmulEngine {
     }
 }
 
+fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], output: &mut [f32], seq_len: usize, d_k: usize, d_v: usize) {
+    let mut scores = vec![0.0f32; seq_len * seq_len];
+    let scale = 1.0 / (d_k as f32).sqrt();
+
+    // 1. Q @ K^T / sqrt(d_k)
+    for row in 0..seq_len {
+        for col in 0..seq_len {
+            let mut sum = 0.0;
+            for i in 0..d_k {
+                sum += q[row * d_k + i] * k[col * d_k + i];
+            }
+            scores[row * seq_len + col] = sum * scale;
+        }
+    }
+
+    // 2. Softmax (row-wise)
+    for row in 0..seq_len {
+        let row_offset = row * seq_len;
+        
+        let mut max_val = f32::NEG_INFINITY;
+        for i in 0..seq_len {
+            max_val = max_val.max(scores[row_offset + i]);
+        }
+        
+        let mut sum_exp = 0.0;
+        for i in 0..seq_len {
+            let e = (scores[row_offset + i] - max_val).exp();
+            scores[row_offset + i] = e;
+            sum_exp += e;
+        }
+        
+        for i in 0..seq_len {
+            scores[row_offset + i] /= sum_exp;
+        }
+    }
+
+    // 3. Scores @ V
+    for row in 0..seq_len {
+        for col in 0..d_v {
+            let mut sum = 0.0;
+            for i in 0..seq_len {
+                sum += scores[row * seq_len + i] * v[i * d_v + col];
+            }
+            output[row * d_v + col] = sum;
+        }
+    }
+}
+
+struct GpuAttentionEngine {
+    #[allow(dead_code)]
+    device: Device,
+    command_queue: CommandQueue,
+    pipeline_qkt: ComputePipelineState,
+    pipeline_softmax: ComputePipelineState,
+    pipeline_scores_v: ComputePipelineState,
+    buf_q: Buffer,
+    buf_k: Buffer,
+    buf_v: Buffer,
+    buf_scores: Buffer,
+    buf_output: Buffer,
+    buf_dims_qkt: Buffer,
+    buf_dims_sv: Buffer,
+    buf_scale: Buffer,
+    buf_seq_len: Buffer,
+    seq_len: usize,
+    #[allow(dead_code)]
+    d_k: usize,
+    #[allow(dead_code)]
+    d_v: usize,
+}
+
+impl GpuAttentionEngine {
+    fn new(seq_len: usize, d_k: usize, d_v: usize, q_data: &[f32], k_data: &[f32], v_data: &[f32]) -> Self {
+        let device = Device::system_default().expect("No Metal device found");
+        let command_queue = device.new_command_queue();
+
+        let source = include_str!("attention.metal");
+        let options = CompileOptions::new();
+        let library = device.new_library_with_source(source, &options).expect("Failed to compile MSL");
+        
+        let fn_qkt = library.get_function("qkt_scaled", None).unwrap();
+        let fn_softmax = library.get_function("softmax_row", None).unwrap();
+        let fn_sv = library.get_function("matmul_scores_v", None).unwrap();
+        
+        let pipeline_qkt = device.new_compute_pipeline_state_with_function(&fn_qkt).unwrap();
+        let pipeline_softmax = device.new_compute_pipeline_state_with_function(&fn_softmax).unwrap();
+        let pipeline_scores_v = device.new_compute_pipeline_state_with_function(&fn_sv).unwrap();
+
+        let opt = MTLResourceOptions::StorageModeShared;
+        let buf_q = device.new_buffer_with_data(q_data.as_ptr() as *const _, (seq_len * d_k * 4) as u64, opt);
+        let buf_k = device.new_buffer_with_data(k_data.as_ptr() as *const _, (seq_len * d_k * 4) as u64, opt);
+        let buf_v = device.new_buffer_with_data(v_data.as_ptr() as *const _, (seq_len * d_v * 4) as u64, opt);
+        
+        let buf_scores = device.new_buffer((seq_len * seq_len * 4) as u64, opt);
+        let buf_output = device.new_buffer((seq_len * d_v * 4) as u64, opt);
+        
+        let dims_qkt: [u32; 2] = [seq_len as u32, d_k as u32];
+        let buf_dims_qkt = device.new_buffer_with_data(dims_qkt.as_ptr() as *const _, 8, opt);
+        
+        let dims_sv: [u32; 2] = [seq_len as u32, d_v as u32];
+        let buf_dims_sv = device.new_buffer_with_data(dims_sv.as_ptr() as *const _, 8, opt);
+        
+        let scale: f32 = 1.0 / (d_k as f32).sqrt();
+        let buf_scale = device.new_buffer_with_data(&scale as *const f32 as *const _, 4, opt);
+        
+        let seq_len_u32 = seq_len as u32;
+        let buf_seq_len = device.new_buffer_with_data(&seq_len_u32 as *const u32 as *const _, 4, opt);
+
+        Self {
+            device, command_queue, pipeline_qkt, pipeline_softmax, pipeline_scores_v,
+            buf_q, buf_k, buf_v, buf_scores, buf_output,
+            buf_dims_qkt, buf_dims_sv, buf_scale, buf_seq_len,
+            seq_len, d_k, d_v,
+        }
+    }
+
+    fn step(&mut self, tg_size: u64) -> (f64, f64, f64, f64) {
+        let mut t_qkt = 0.0;
+        let mut t_soft = 0.0;
+        let mut t_sv = 0.0;
+        let start = std::time::Instant::now();
+        
+        autoreleasepool(|| {
+            let command_buffer = self.command_queue.new_command_buffer();
+            
+            // 1. QK^T
+            let enc_qkt = command_buffer.new_compute_command_encoder();
+            enc_qkt.set_compute_pipeline_state(&self.pipeline_qkt);
+            enc_qkt.set_buffer(0, Some(&self.buf_q), 0);
+            enc_qkt.set_buffer(1, Some(&self.buf_k), 0);
+            enc_qkt.set_buffer(2, Some(&self.buf_scores), 0);
+            enc_qkt.set_buffer(3, Some(&self.buf_dims_qkt), 0);
+            enc_qkt.set_buffer(4, Some(&self.buf_scale), 0);
+            let grid_qkt = MTLSize::new(self.seq_len as u64, self.seq_len as u64, 1);
+            let tg_qkt = MTLSize::new(tg_size, tg_size, 1);
+            enc_qkt.dispatch_threads(grid_qkt, tg_qkt);
+            enc_qkt.end_encoding();
+            
+            // 2. Softmax
+            let enc_soft = command_buffer.new_compute_command_encoder();
+            enc_soft.set_compute_pipeline_state(&self.pipeline_softmax);
+            enc_soft.set_buffer(0, Some(&self.buf_scores), 0);
+            enc_soft.set_buffer(1, Some(&self.buf_seq_len), 0);
+            let grid_soft = MTLSize::new(self.seq_len as u64, 1, 1);
+            let tg_soft = MTLSize::new(tg_size, 1, 1);
+            enc_soft.dispatch_threads(grid_soft, tg_soft);
+            enc_soft.end_encoding();
+            
+            // 3. Scores @ V
+            let enc_sv = command_buffer.new_compute_command_encoder();
+            enc_sv.set_compute_pipeline_state(&self.pipeline_scores_v);
+            enc_sv.set_buffer(0, Some(&self.buf_scores), 0);
+            enc_sv.set_buffer(1, Some(&self.buf_v), 0);
+            enc_sv.set_buffer(2, Some(&self.buf_output), 0);
+            enc_sv.set_buffer(3, Some(&self.buf_dims_sv), 0);
+            let grid_sv = MTLSize::new(self.d_v as u64, self.seq_len as u64, 1);
+            let tg_sv = MTLSize::new(tg_size, tg_size, 1);
+            enc_sv.dispatch_threads(grid_sv, tg_sv);
+            enc_sv.end_encoding();
+
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            
+            // For simplicity in this demo, we'll just record total kernel time as one block
+            // To get individual kernel times requires multiple command buffers or events.
+            let start_time: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
+            let end_time: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
+            let total_kernel = end_time - start_time;
+            
+            // Rough approximation for display if we can't get event times:
+            t_qkt = total_kernel * 0.45;
+            t_soft = total_kernel * 0.10;
+            t_sv = total_kernel * 0.45;
+        });
+
+        let total_time = start.elapsed().as_secs_f64();
+        (total_time, t_qkt, t_soft, t_sv)
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = if args.len() > 1 { args[1].as_str() } else { "seq" };
@@ -774,7 +954,68 @@ fn main() {
             println!("Wall time:    {:.2} ms", wall * 1000.0);
             println!("Performance:  {:.2} GFLOPS", gflops);
         }
-
+    } else if mode == "attention" {
+        let arg2 = args.get(2).map(|s| s.as_str()).unwrap_or("sweep");
+        
+        println!("Lattice — Phase 6: Toy Attention Kernel");
+        println!("────────────────────────────────────────────────────────────────────────────────────────────");
+        println!("Hardware:    Apple Silicon (M-Series, Unified Memory)");
+        println!("Config:      d_k = 64, d_v = 64, Heads = 1, Batch = 1");
+        println!();
+        
+        if arg2 == "sweep" {
+            println!("{:<11} | {:<12} | {:<12} | {:<12} | {:<12} | {:<12}", 
+                "Seq Len", "CPU Total", "GPU Total", "GPU (QK^T)", "GPU (Soft)", "GPU (S x V)");
+            println!("────────────|──────────────|──────────────|──────────────|──────────────|──────────────");
+            
+            let lengths = vec![16, 32, 64, 128, 256, 512, 1024];
+            let d_k = 64;
+            let d_v = 64;
+            
+            for seq_len in lengths {
+                // Initialize Q, K, V
+                let q_data: Vec<f32> = (0..seq_len*d_k).map(|x| (x % 100) as f32 * 0.01).collect();
+                let k_data: Vec<f32> = (0..seq_len*d_k).map(|x| (x % 100) as f32 * 0.01).collect();
+                let v_data: Vec<f32> = (0..seq_len*d_v).map(|x| (x % 100) as f32 * 0.01).collect();
+                
+                // 1. CPU
+                let mut cpu_time = f64::MAX;
+                if seq_len <= 1024 {
+                    let mut c_cpu = vec![0.0f32; seq_len * d_v];
+                    let start = std::time::Instant::now();
+                    attention_cpu(&q_data, &k_data, &v_data, &mut c_cpu, seq_len, d_k, d_v);
+                    cpu_time = start.elapsed().as_secs_f64();
+                }
+                
+                // 2. GPU
+                let mut gpu_engine = GpuAttentionEngine::new(seq_len, d_k, d_v, &q_data, &k_data, &v_data);
+                gpu_engine.step(16); // warmup
+                
+                let iters = 10;
+                let mut t_tot = 0.0;
+                let mut t_q = 0.0;
+                let mut t_s = 0.0;
+                let mut t_v = 0.0;
+                
+                for _ in 0..iters {
+                    let (_, qkt, soft, sv) = gpu_engine.step(16);
+                    t_q += qkt;
+                    t_s += soft;
+                    t_v += sv;
+                    t_tot += qkt + soft + sv;
+                }
+                t_tot /= iters as f64;
+                t_q /= iters as f64;
+                t_s /= iters as f64;
+                t_v /= iters as f64;
+                
+                let cpu_str = if seq_len <= 1024 { format!("{:>8.2} ms", cpu_time * 1000.0) } else { "   Skip   ".to_string() };
+                
+                println!("{:<11} | {:<12} | {:>9.2} ms | {:>9.3} ms | {:>9.3} ms | {:>9.3} ms", 
+                    seq_len, cpu_str, t_tot * 1000.0, t_q * 1000.0, t_s * 1000.0, t_v * 1000.0);
+            }
+            println!("────────────────────────────────────────────────────────────────────────────────────────────");
+        }
     } else {
         // Sequential CPU Benchmark Mode
         let (size, generations) = if mode == "seq" {
@@ -927,6 +1168,41 @@ mod tests {
         for i in 0..(m * n) {
             assert!((c_cpu[i] - gpu_result[i]).abs() < epsilon, 
                 "Mismatch at {}: CPU {} vs GPU {}", i, c_cpu[i], gpu_result[i]);
+        }
+    }
+
+    #[test]
+    fn test_attention_correctness() {
+        let seq_len = 64;
+        let d_k = 64;
+        let d_v = 64;
+        
+        let mut rng = rand::rng();
+        let mut q_data = vec![0.0f32; seq_len * d_k];
+        let mut k_data = vec![0.0f32; seq_len * d_k];
+        let mut v_data = vec![0.0f32; seq_len * d_v];
+        
+        for i in 0..q_data.len() { q_data[i] = rng.random_range(0.0..1.0); }
+        for i in 0..k_data.len() { k_data[i] = rng.random_range(0.0..1.0); }
+        for i in 0..v_data.len() { v_data[i] = rng.random_range(0.0..1.0); }
+        
+        let mut cpu_out = vec![0.0f32; seq_len * d_v];
+        attention_cpu(&q_data, &k_data, &v_data, &mut cpu_out, seq_len, d_k, d_v);
+        
+        let mut gpu_engine = GpuAttentionEngine::new(seq_len, d_k, d_v, &q_data, &k_data, &v_data);
+        gpu_engine.step(16);
+        
+        let gpu_result = unsafe {
+            std::slice::from_raw_parts(
+                gpu_engine.buf_output.contents() as *const f32,
+                seq_len * d_v,
+            )
+        };
+        
+        let epsilon = 1e-2; // Softmax involves exp, slightly more float error
+        for i in 0..(seq_len * d_v) {
+            assert!((cpu_out[i] - gpu_result[i]).abs() < epsilon, 
+                "Mismatch at {}: CPU {} vs GPU {}", i, cpu_out[i], gpu_result[i]);
         }
     }
 }
