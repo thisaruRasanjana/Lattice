@@ -1,2 +1,5 @@
 /target
 game_of_life_gpu_architecture.md
+inference/venv/
+get-pip.py
+.DS_Store

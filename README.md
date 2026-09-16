@@ -16,7 +16,7 @@ The goal is to understand how parallel architectures behave at the hardware leve
 - [x] **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
 - [x] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
 - [x] **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
-- [ ] **Phase 7 — Local LLM Profiling:** MLX / llama.cpp on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
+- [x] **Phase 7 — Local LLM Profiling:** MLX / llama.cpp on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
 - [ ] **Phase 8 — Writeup:** Portfolio narrative connecting phase 4 throughput results to phase 7 inference profiling.
 
 ---
@@ -67,6 +67,10 @@ cargo run --release -- matmul 1024
 
 # GPU Attention benchmark sweep (Phase 6)
 cargo run --release -- attention sweep
+
+# LLM Inference Profiling (Phase 7 — requires Python venv)
+source inference/venv/bin/activate
+python3 inference/profile.py
 
 # Live random-seed visualization
 cargo run -- visual
