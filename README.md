@@ -17,7 +17,7 @@ The goal is to understand how parallel architectures behave at the hardware leve
 - [x] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
 - [x] **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
 - [x] **Phase 7 — Local LLM Profiling:** MLX / llama.cpp on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
-- [ ] **Phase 8 — Writeup:** Portfolio narrative connecting phase 4 throughput results to phase 7 inference profiling.
+- [x] **Phase 8 — Writeup:** Portfolio narrative connecting phase 4 throughput results to phase 7 inference profiling.
 
 ---
 
