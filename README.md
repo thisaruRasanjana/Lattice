@@ -8,16 +8,16 @@ The goal is to understand how parallel architectures behave at the hardware leve
 
 ---
 
-## Roadmap
+## Project Phases
 
-- [x] **Phase 1 — Sequential CPU:** Flat memory layout, double buffering, and B3/S23 state updates with baseline throughput & bandwidth profiling.
-- [x] **Phase 2 — Multi-threaded CPU:** Row-band partitioning via `std::thread::scope`, synchronization-free disjoint writes, multi-core scaling analysis.
-- [x] **Phase 3 — GPU (Metal):** Per-cell update as a Metal compute shader dispatched from Rust. Unified memory via `storageModeShared` with isolated dispatch vs kernel timing.
-- [x] **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
-- [x] **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
-- [x] **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
-- [x] **Phase 7 — Local LLM Profiling:** MLX / llama.cpp on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
-- [x] **Phase 8 — Writeup:** Portfolio narrative connecting phase 4 throughput results to phase 7 inference profiling.
+- **Phase 1 — Sequential CPU:** Flat memory layout, double buffering, and B3/S23 state updates with baseline throughput & bandwidth profiling.
+- **Phase 2 — Multi-threaded CPU:** Row-band partitioning via `std::thread::scope`, synchronization-free disjoint writes, multi-core scaling analysis.
+- **Phase 3 — GPU (Metal):** Per-cell update as a Metal compute shader dispatched from Rust. Unified memory via `storageModeShared` with isolated dispatch vs kernel timing.
+- **Phase 4 — Bottleneck Profiling & Analysis:** Comprehensive cross-architecture comparison across grid sweeps, hardware bandwidth saturation, and warp occupancy.
+- **Phase 5 — Matmul Kernel:** Naive GPU matrix multiplication. Each thread computes one output element.
+- **Phase 6 — Toy Attention Kernel:** `QK^T`, row-wise softmax, and weighted sum as three separate dispatches.
+- **Phase 7 — Local LLM Profiling:** MLX on M2. Time-to-first-token, tokens/sec, KV-cache memory growth.
+- **Phase 8 — Writeup:** Portfolio narrative connecting phase 4 throughput results to phase 7 inference profiling.
 
 ---
 
